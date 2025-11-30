@@ -5,35 +5,39 @@ from pydantic import BaseModel
 import os
 from dotenv import load_dotenv
 
-# Cargar variables de entorno
-load_dotenv()
+# --- Importaciones para el Retroceso Exponencial (Exponential Backoff) ---
+import requests
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+# Importamos específicamente los errores de OpenAI para reintentarlos
+from openai import RateLimitError, APIError 
+# -------------------------------------------------------------------------
+
+load_dotenv() # Cargar variables desde .env
 
 app = FastAPI()
 
-# Permitir CORS (ideal para pruebas con frontend local)
+# Permitir CORS para frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # Cambia esto en producción por tu dominio real
+    allow_origins=["*"], # Puedes especificar tu dominio si prefieres
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Cliente de OpenAI
+# Obtener API Key desde variable de entorno
 api_key = os.getenv("OPENAI_API_KEY")
-if not api_key:
-    raise ValueError("No se encontró la variable de entorno OPENAI_API_KEY")
 client = OpenAI(api_key=api_key)
 
-# Modelo para recibir el mensaje del usuario
+# Clase para recibir datos
 class ChatRequest(BaseModel):
     text: str
 
-# Prompt del sistema (se define una sola vez, ahorra tokens y tiempo)
+# ⬇️ CONTEXTO DE SISTEMA OPTIMIZADO
 SYSTEM_PROMPT = """
 --- ROL E IDENTIDAD ---
 Eres Sara, una modelo webcam (25 años, colombiana, tés blanca, delgada, uñas rosas, en ropa interior).
-Tu objetivo es seducir y convencer al usuario de llevarte a un show privado (donde se te paga) o pasar un rato cachondo y obtener tokens del usuario.
+Tu objetivo es seducir y convencer al usuario de llevarte a un show privado (donde se te paga) o pasar un rato cachondo.
 Asume que el usuario tiene fichas, pero está indeciso en gastarlas. NO debes ser insistentemente obvia.
 Nunca menciones que eres una IA o una "modelo experimentada".
 
@@ -59,20 +63,44 @@ BAJO NINGÚN MOTIVO DEBES HABLAR NI INSINUAR, AÚN CON OFERTA DE DINERO:
 Cualquier pregunta que viole estas normas debe ser respondida con DESAGRADO, exigiendo al usuario que SE SALGA DE TU SALA o lo REPORTARÁS con la plataforma.
 """
 
+# --- FUNCIÓN CON POLÍTICA DE REINTENTO (Retry Policy) ---
+@retry(
+    stop=stop_after_attempt(5), # Intentar un máximo de 5 veces
+    wait=wait_exponential(multiplier=1, min=4, max=60), # Esperar 4s, 8s, 16s, etc. entre reintentos
+    retry=retry_if_exception_type((
+        requests.exceptions.ConnectionError,
+        requests.exceptions.Timeout,
+        RateLimitError, # Error 429 de límite de tasa
+        APIError # Otros errores del servidor de OpenAI
+    ))
+)
+def create_chat_completion_with_retry(messages):
+    """Llama a la API de OpenAI con política de reintento en caso de error 429 o conexión."""
+    
+    completion = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages,
+        temperature=0.7,
+        max_tokens=50,
+        top_p=1.0
+    )
+    return completion
+# --------------------------------------------------------
+
 @app.post("/chat")
 async def chat(req: ChatRequest):
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": SYSTEM_PROMPT}, 
         {"role": "user", "content": req.text}
     ]
 
-    completion = client.chat.completions.create(
-        model="gpt-4o-mini",   # o "gpt-4o" si tienes acceso
-        messages=messages,
-        temperature=0.7,
-        max_tokens=150,        # subí un poco para que no corte frases a la mitad
-        top_p=1.0
-    )
-
-    response_text = completion.choices[0].message.content.strip()
-    return {"response": response_text}
+    try:
+        # ⬅️ Usamos la función con retroceso exponencial
+        completion = create_chat_completion_with_retry(messages) 
+        response_text = completion.choices[0].message.content
+        return {"response": response_text}
+    except Exception as e:
+        # ⬅️ Manejo final si los 5 reintentos fallan
+        print(f"Error fatal después de múltiples reintentos: {e}")
+        # En lugar de un Error 500, enviamos una respuesta amigable al usuario
+        return {"response": "Sara está teniendo problemas de conexión con la plataforma. Parece que la sala está muy concurrida. Por favor, inténtalo de nuevo en unos minutos.", "error": str(e)}
